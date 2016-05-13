@@ -73,6 +73,9 @@ type preAPIConfig struct {
 	// and ensure that it is mounted inside the container's rootfs
 	Tty bool `json:"tty,omitempty"`
 
+	// MountConfig from container.json
+	MountConfig mountConfig `json:"mount_config"`
+
 	// Namespaces specifies the container's namespaces that it should setup when cloning the init process
 	// If a namespace is not provided that namespace is shared from the container's parent process
 	Namespaces []configs.Namespace `json:"namespaces,omitempty"`
@@ -102,6 +105,10 @@ type preAPIConfig struct {
 	// RestrictSys will remount /proc/sys, /sys, and mask over sysrq-trigger as well as /proc/irq and
 	// /proc/bus
 	RestrictSys bool `json:"restrict_sys,omitempty"`
+}
+
+type mountConfig struct {
+	Mounts []*configs.Mount `json:"mounts"`
 }
 
 // Network defines configuration for a container's networking stack
@@ -275,6 +282,7 @@ func ReadConfig(dockerRoot, dockerRun, containerID string) (*configs.Config, err
 	if config.Cgroups != nil {
 		result.Cgroups = config.Cgroups
 	}
+	result.Mounts = config.MountConfig.Mounts
 
 	return &result, nil
 }

@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/golang/glog"
 	"github.com/google/cadvisor/container"
 	containerlibcontainer "github.com/google/cadvisor/container/libcontainer"
 	"github.com/google/cadvisor/fs"
@@ -196,6 +197,24 @@ func newDockerContainerHandler(
 		}
 	}
 
+	dockerInfo, err := DockerInfo()
+	if err != nil {
+		glog.Warningf("Unable to connect to Docker: %v", err)
+	}
+
+	// Get the mounted filesystems for the container using /proc/<pid>/mountinfo.
+	libcontainerConfig, err := handler.readLibcontainerConfig()
+	if err != nil {
+		glog.Errorf("Failed to read Container Config for container %q: %v", id, err)
+	} else {
+		// Get filesystem info based on MountConfig for the container.
+		context := fs.Context{DockerRoot: RootDir(), DockerInfo: dockerInfo}
+		handler.fsInfo, err = fs.ContainerFsInfo(context, handler.pid, libcontainerConfig)
+		if err != nil {
+			glog.Errorf("Failed to get mounted filesystems for container %q: %v", id, err)
+		}
+	}
+
 	return handler, nil
 }
 
@@ -268,7 +287,7 @@ func libcontainerConfigToContainerSpec(config *libcontainerconfigs.Config, mi *i
 
 func (self *dockerContainerHandler) needNet() bool {
 	if !self.ignoreMetrics.Has(container.NetworkUsageMetrics) {
-		return !strings.HasPrefix(self.networkMode, "container:")
+		return true
 	}
 	return false
 }
@@ -288,7 +307,7 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
 
 	if !self.ignoreMetrics.Has(container.DiskUsageMetrics) {
 		switch self.storageDriver {
-		case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
+		case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver, devicemapperStorageDriver:
 			spec.HasFilesystem = true
 		}
 	}
@@ -301,12 +320,47 @@ func (self *dockerContainerHandler) GetSpec() (info.ContainerSpec, error) {
 	return spec, err
 }
 
+func (self *dockerContainerHandler) getContainerFsStats(stats *info.ContainerStats) error {
+	filesystems, err := self.fsInfo.GetGlobalFsInfo()
+	if err != nil {
+		return err
+	}
+	for _, fs := range filesystems {
+		stats.Filesystem = append(stats.Filesystem,
+			info.FsStats{
+				Device:          fs.Device,
+				Limit:           fs.Capacity,
+				Usage:           fs.Capacity - fs.Free,
+				ReadsCompleted:  fs.DiskStats.ReadsCompleted,
+				ReadsMerged:     fs.DiskStats.ReadsMerged,
+				SectorsRead:     fs.DiskStats.SectorsRead,
+				ReadTime:        fs.DiskStats.ReadTime,
+				WritesCompleted: fs.DiskStats.WritesCompleted,
+				WritesMerged:    fs.DiskStats.WritesMerged,
+				SectorsWritten:  fs.DiskStats.SectorsWritten,
+				WriteTime:       fs.DiskStats.WriteTime,
+				IoInProgress:    fs.DiskStats.IoInProgress,
+				IoTime:          fs.DiskStats.IoTime,
+				WeightedIoTime:  fs.DiskStats.WeightedIoTime,
+			})
+	}
+
+	return nil
+}
+
 func (self *dockerContainerHandler) getFsStats(stats *info.ContainerStats) error {
 	if self.ignoreMetrics.Has(container.DiskUsageMetrics) {
 		return nil
 	}
+
+	if self.fsInfo == nil {
+		return nil
+	}
+
 	switch self.storageDriver {
 	case aufsStorageDriver, overlayStorageDriver, zfsStorageDriver:
+	case devicemapperStorageDriver:
+		return self.getContainerFsStats(stats)
 	default:
 		return nil
 	}

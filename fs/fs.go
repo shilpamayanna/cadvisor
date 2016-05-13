@@ -34,7 +34,10 @@ import (
 
 	"github.com/docker/docker/pkg/mount"
 	"github.com/golang/glog"
+	"github.com/google/cadvisor/utils/sysfs"
+	"github.com/google/cadvisor/utils/sysinfo"
 	zfs "github.com/mistifyio/go-zfs"
+	libcontainerconfigs "github.com/opencontainers/runc/libcontainer/configs"
 )
 
 const (
@@ -43,11 +46,12 @@ const (
 )
 
 type partition struct {
-	mountpoint string
-	major      uint
-	minor      uint
-	fsType     string
-	blockSize  uint
+	mountpoint          string
+	containerMountpoint string
+	major               uint
+	minor               uint
+	fsType              string
+	blockSize           uint
 }
 
 type RealFsInfo struct {
@@ -66,6 +70,16 @@ type Context struct {
 	DockerInfo map[string]string
 }
 
+func hasSupportedFsType(fsType string) bool {
+	supportedFsType := map[string]bool{
+		// all ext systems are checked through prefix.
+		"btrfs": true,
+		"xfs":   true,
+		"zfs":   true,
+	}
+	return supportedFsType[fsType]
+}
+
 func NewFsInfo(context Context) (FsInfo, error) {
 	mounts, err := mount.GetMounts()
 	if err != nil {
@@ -76,15 +90,10 @@ func NewFsInfo(context Context) (FsInfo, error) {
 		labels:     make(map[string]string, 0),
 		dmsetup:    &defaultDmsetupClient{},
 	}
-	supportedFsType := map[string]bool{
-		// all ext systems are checked through prefix.
-		"btrfs": true,
-		"xfs":   true,
-		"zfs":   true,
-	}
+
 	for _, mount := range mounts {
 		var Fstype string
-		if !strings.HasPrefix(mount.Fstype, "ext") && !supportedFsType[mount.Fstype] {
+		if !strings.HasPrefix(mount.Fstype, "ext") && !hasSupportedFsType(mount.Fstype) {
 			continue
 		}
 		// Avoid bind mounts.
@@ -108,6 +117,69 @@ func NewFsInfo(context Context) (FsInfo, error) {
 
 	glog.Infof("Filesystem partitions: %+v", fsInfo.partitions)
 	fsInfo.addSystemRootLabel()
+	return fsInfo, nil
+}
+
+// Returns info for all filesystems used by container
+func ContainerFsInfo(context Context, pid int, mountConfig *libcontainerconfigs.Config) (FsInfo, error) {
+	mounts, err := mount.PidMountInfo(pid)
+	if err != nil {
+		return nil, err
+	}
+
+	sysFs, err := sysfs.NewRealSysFs()
+	if err != nil {
+		return nil, err
+	}
+
+	diskMap, err := sysinfo.GetBlockDeviceInfo(sysFs)
+	if err != nil {
+		return nil, err
+	}
+
+	fsInfo := &RealFsInfo{
+		partitions: make(map[string]partition, 0),
+		labels:     make(map[string]string, 0),
+		dmsetup:    &defaultDmsetupClient{},
+	}
+
+	for _, mount := range mounts {
+		if !strings.HasPrefix(mount.Fstype, "ext") && !hasSupportedFsType(mount.Fstype) {
+			continue
+		}
+		// Find block device with matching device major/minor
+		source := ""
+		for _, disk := range diskMap {
+			if mount.Major == int(disk.Major) && mount.Minor == int(disk.Minor) {
+				source = path.Join("/dev", disk.Name)
+				break
+			}
+		}
+		if source == "" {
+			continue
+		}
+		// Avoid bind mounts.
+		if _, ok := fsInfo.partitions[source]; ok {
+			continue
+		}
+		// PidMountInfo returns mountpoints inside the container. Need to
+		// use corresponding Source mountpoints in Host namespace
+		for _, srcMount := range mountConfig.Mounts {
+			if mount.Mountpoint == srcMount.Destination {
+				fsInfo.partitions[source] = partition{
+					mountpoint:          srcMount.Source,
+					containerMountpoint: srcMount.Destination,
+					major:               uint(mount.Major),
+					minor:               uint(mount.Minor),
+				}
+			}
+		}
+	}
+
+	fsInfo.addDockerImagesLabel(context)
+	glog.Infof("Filesystem partitions: %+v", fsInfo.partitions)
+	fsInfo.addSystemRootLabel()
+
 	return fsInfo, nil
 }
 
@@ -263,9 +335,13 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
 			if err != nil {
 				glog.Errorf("Stat fs failed. Error: %v", err)
 			} else {
+				fsDevice := device
+				if partition.containerMountpoint != "" {
+					fsDevice = partition.containerMountpoint
+				}
 				deviceSet[device] = struct{}{}
 				fs.DeviceInfo = DeviceInfo{
-					Device: device,
+					Device: fsDevice,
 					Major:  uint(partition.major),
 					Minor:  uint(partition.minor),
 				}
@@ -277,7 +353,7 @@ func (self *RealFsInfo) GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, er
 	return filesystems, nil
 }
 
-var partitionRegex = regexp.MustCompile(`^(?:(?:s|xv)d[a-z]+\d*|dm-\d+)$`)
+var partitionRegex = regexp.MustCompile(`^(?:(?:s|xv)d[a-z]+\d*|dm-\d+|nvme+\d+n+\d+)$`)
 
 func getDiskStatsMap(diskStatsFile string) (map[string]DiskStats, error) {
 	diskStatsMap := make(map[string]DiskStats)
